@@ -1,0 +1,27 @@
+id: mongodb-unauthorized
+
+info:
+  name: MongoDB 未授权访问漏洞
+  author: god
+  severity: high
+  description: MongoDB 数据库未设置认证，可直接连接读取所有数据
+  metadata:
+    fofa-query: app="MongoDB"
+  tags: mongodb,unauthorized
+
+http:
+- raw:
+  - |
+    @timeout: 10s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "It looks like you are trying to access MongoDB"
+        - "mongodb"
+      condition: or

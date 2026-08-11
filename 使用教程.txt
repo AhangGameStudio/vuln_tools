@@ -1,0 +1,286 @@
+================================================================================
+                    aivuln CLI — Python 版漏洞扫描工具 使用教程
+================================================================================
+
+一、工具简介
+--------------------------------------------------------------------------------
+aivuln CLI 是一款基于 Python 的自动化漏洞扫描工具，支持 YAML 格式 POC（Proof
+of Concept）文件，兼容 Nuclei 模板语法。工具内置 78+ 个高危/中危漏洞检测规则，
+涵盖 RCE、SQL 注入、反序列化、未授权访问、文件读取、弱口令等常见漏洞类型。
+
+核心特性：
+  - 支持 YAML 格式 POC，兼容 Nuclei 模板语法
+  - 自动检测并转码 GBK/GB2312 响应（解决中文乱码）
+  - 可配置扫描间隔，默认 2 秒
+  - 支持 AI 智能分析（需配置 API）
+  - 按危害级别排序执行（critical → high → medium → low）
+
+
+二、环境准备
+--------------------------------------------------------------------------------
+
+1. 安装 Python 3.10+
+   下载地址：https://www.python.org/downloads/
+   安装时勾选 "Add Python to PATH"
+
+2. 安装依赖
+   打开命令行，进入工具目录：
+     cd E:\AI-Tools\漏洞工具
+     pip install pyyaml requests
+
+3. 验证安装
+     python vuln_cli.py help
+
+   看到帮助信息即表示安装成功。
+
+
+三、基本用法
+--------------------------------------------------------------------------------
+
+1. 扫描目标
+   python vuln_cli.py scan <目标URL>
+
+   示例：
+     python vuln_cli.py scan http://127.0.0.1:8080
+     python vuln_cli.py scan https://target.com
+
+2. 列出所有 POC
+   python vuln_cli.py list
+
+   显示所有可用 POC 的 ID、名称和危害级别。
+
+3. 显示帮助
+   python vuln_cli.py help
+
+
+四、高级选项
+--------------------------------------------------------------------------------
+
+1. 自定义 POC 目录
+   --pocs <目录路径>
+
+   示例：
+     python vuln_cli.py scan http://target.com --pocs ./my_pocs
+     python vuln_cli.py list --pocs ./my_pocs
+
+2. 调整扫描间隔
+   --interval <秒数>
+
+   默认间隔 2 秒，可加快或减慢：
+     python vuln_cli.py scan http://target.com --interval 1      # 1 秒间隔
+     python vuln_cli.py scan http://target.com --interval 0.5    # 0.5 秒间隔
+
+3. 启用 AI 分析
+   --ai
+
+   扫描完成后自动调用 AI 分析漏洞风险和修复建议：
+     python vuln_cli.py scan http://target.com --ai
+
+   注意：使用 AI 功能前需先配置 API（见第五节）。
+
+
+五、AI 配置
+--------------------------------------------------------------------------------
+
+1. 配置 AI API
+   python vuln_cli.py /ai
+   或
+   python vuln_cli.py /AI配置
+
+   交互式输入：
+     API_URL  — AI 服务的 API 地址（如 https://api.openai.com/v1）
+     API_KEY  — API 密钥
+     MODEL    — 模型名称（如 gpt-3.5-turbo、gpt-4 等）
+
+   配置保存在 .config/ai_config.json 文件中。
+
+2. 使用 AI 分析
+   配置完成后，扫描时加 --ai 参数即可：
+     python vuln_cli.py scan http://target.com --ai
+
+   AI 会分析扫描结果，给出：
+     - 漏洞风险等级评估
+     - 利用难度分析
+     - 修复建议
+
+
+六、POC 文件格式
+--------------------------------------------------------------------------------
+
+工具使用 YAML 格式 POC，兼容 Nuclei 模板语法。基本结构如下：
+
+  id: 漏洞唯一标识
+
+  info:
+    name: 漏洞名称
+    author: 作者
+    severity: 危害级别（critical/high/medium/low/info）
+    description: 漏洞描述
+    tags: 标签（逗号分隔）
+
+  http:
+  - raw:
+    - |
+      @timeout: 30s
+      GET /path HTTP/1.1
+      Host: {{Hostname}}
+      Header: value
+
+      body content
+
+    matchers-condition: and
+    matchers:
+      - type: word
+        part: body
+        words:
+          - "keyword"
+        condition: and
+
+支持的特性：
+  - 模板变量：{{Hostname}}、{{BaseURL}}、{{randstr}} 等
+  - 原始 HTTP 报文（raw 格式）
+  - 多种匹配器：status、word、regex、dsl
+  - 匹配条件：and / or
+  - 提取器：regex、header
+  - 超时控制：@timeout: 30s
+
+
+七、常用漏洞检测示例
+--------------------------------------------------------------------------------
+
+1. Log4j2 RCE (CVE-2021-44228)
+   python vuln_cli.py scan http://target.com --pocs ./pocs/apache-log4j2-rce-CVE-2021-44228.yaml
+
+2. Spring4Shell (CVE-2022-22965)
+   python vuln_cli.py scan http://target.com --pocs ./pocs/spring4shell-rce-CVE-2022-22965.yaml
+
+3. ThinkPHP RCE
+   python vuln_cli.py scan http://target.com --pocs ./pocs/thinkphp-rce.yaml
+
+4. Shiro 反序列化
+   python vuln_cli.py scan http://target.com --pocs ./pocs/shiro-rememberme-deserialization.yaml
+
+5. Redis 未授权访问
+   python vuln_cli.py scan http://target.com --pocs ./pocs/redis-unauthorized.yaml
+
+6. Tomcat 弱口令
+   python vuln_cli.py scan http://target.com --pocs ./pocs/tomcat-manager-weak-password.yaml
+
+7. Jenkins 未授权访问
+   python vuln_cli.py scan http://target.com --pocs ./pocs/jenkins-unauthorized.yaml
+
+8. Fastjson 反序列化
+   python vuln_cli.py scan http://target.com --pocs ./pocs/fastjson-deserialization-rce.yaml
+
+
+八、输出说明
+--------------------------------------------------------------------------------
+
+扫描过程中会实时显示进度：
+
+  [1/93] Apache Log4j2 远程代码执行漏洞 (CVE-2021-44228) [CRITICAL] ✓ 命中!
+      → http://target.com/?x=${jndi:ldap://...}
+      证据：dns interaction detected
+
+  [2/93] Spring4Shell 远程代码执行漏洞 (CVE-2022-22965) [CRITICAL] ✗ 未命中
+
+扫描完成后显示汇总：
+
+  ============================================================
+    扫描完成!
+    总请求数：186
+    发现漏洞：3
+    按危害级别：CRITICAL:2, HIGH:1
+  ============================================================
+
+
+九、常见问题
+--------------------------------------------------------------------------------
+
+Q: 提示"缺少依赖"怎么办？
+A: 运行 pip install pyyaml requests 安装依赖。
+
+Q: 扫描结果乱码？
+A: 工具已自动处理 GBK/GB2312 编码，如仍有乱码请检查目标编码。
+
+Q: 如何添加自定义 POC？
+A: 将 YAML 文件放入 pocs 目录，或创建新目录并用 --pocs 指定。
+
+Q: AI 分析失败？
+A: 检查 API_URL、API_KEY、MODEL 配置是否正确，网络是否通畅。
+
+Q: 扫描速度太慢？
+A: 使用 --interval 参数减小间隔，如 --interval 0.5。
+
+Q: 如何只检测特定漏洞？
+A: 使用 --pocs 指定单个 POC 文件，如 --pocs ./pocs/redis-unauthorized.yaml
+
+
+十、注意事项
+--------------------------------------------------------------------------------
+
+1. 合法授权
+   本工具仅供授权的安全测试使用。未经授权对他人系统进行扫描属于违法行为。
+
+2. 网络环境
+   确保扫描机与目标网络连通，防火墙未阻断相关端口。
+
+3. 性能影响
+   高频扫描可能影响目标服务性能，建议在生产环境谨慎使用。
+
+4. 误报处理
+   工具可能存在误报，发现漏洞后需人工验证确认。
+
+5. 日志记录
+   建议记录扫描过程和结果，便于后续分析和报告编写。
+
+
+十一、文件结构
+--------------------------------------------------------------------------------
+
+E:\AI-Tools\漏洞工具\
+├── vuln_cli.py              # 主程序
+├── requirements.txt         # Python 依赖
+── 使用教程.txt             # 本文件
+├── .config/
+│   └── ai_config.json       # AI 配置文件（运行 /ai 后生成）
+── pocs/                    # POC 漏洞库
+    ├── apache-log4j2-rce-CVE-2021-44228.yaml
+    ├── spring4shell-rce-CVE-2022-22965.yaml
+    ├── thinkphp-rce.yaml
+    ├── shiro-rememberme-deserialization.yaml
+    ├── redis-unauthorized.yaml
+    ├── elasticsearch-unauthorized.yaml
+    ├── tomcat-manager-weak-password.yaml
+    ├── jenkins-unauthorized.yaml
+    ├── fastjson-deserialization-rce.yaml
+    ├── apache-druid-rce.yaml
+    ├── confluence-path-traversal-CVE-2019-3396.yaml
+    ├── nacos-unauthorized.yaml
+    ├── phpmyadmin-unauthorized.yaml
+    ├── mongodb-unauthorized.yaml
+    ── zabbix-default-password.yaml
+
+
+十二、更新日志
+--------------------------------------------------------------------------------
+
+v1.0 (2026-08-11)
+  - 初始版本
+  - 支持 YAML 格式 POC
+  - 兼容 Nuclei 模板语法
+  - 自动编码转换（GBK/GB2312 → UTF-8）
+  - 支持 AI 智能分析
+  - 内置 15 个常用高危/中危漏洞检测规则
+
+
+================================================================================
+                              技术支持
+================================================================================
+
+如有问题或建议，请查阅项目文档或联系开发团队。
+
+所有操作须确保目标已获合法授权。上述 PoC 仅供授权验证使用，未经授权执行属违法
+行为。
+
+================================================================================

@@ -1,0 +1,43 @@
+id: phpmyadmin-unauthorized
+
+info:
+  name: phpMyAdmin 未授权访问 / 弱口令
+  author: god
+  severity: medium
+  description: phpMyAdmin 数据库管理工具未设置认证或使用弱口令
+  metadata:
+    fofa-query: app="phpMyAdmin"
+  tags: phpmyadmin,weak-password,unauthorized
+
+http:
+- raw:
+  - |
+    @timeout: 15s
+    GET /phpmyadmin/ HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "phpMyAdmin"
+        - "server_sql.php"
+      condition: and
+
+- raw:
+  - |
+    @timeout: 15s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "phpMyAdmin"
+        - "server_sql.php"
+      condition: and

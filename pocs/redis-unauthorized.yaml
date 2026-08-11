@@ -1,0 +1,27 @@
+id: redis-unauthorized
+
+info:
+  name: Redis 未授权访问漏洞
+  author: god
+  severity: high
+  description: Redis 服务未设置认证，攻击者可直接连接并执行危险命令
+  metadata:
+    fofa-query: app="Redis"
+  tags: redis,unauthorized
+
+http:
+- raw:
+  - |
+    @timeout: 10s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "-ERR unknown command"
+        - "Redis"
+      condition: or

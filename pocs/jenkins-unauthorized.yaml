@@ -1,0 +1,42 @@
+id: jenkins-unauthorized
+
+info:
+  name: Jenkins 未授权访问漏洞
+  author: god
+  severity: high
+  description: Jenkins CI/CD 服务未设置认证，可执行任意构建任务导致 RCE
+  metadata:
+    fofa-query: app="Jenkins"
+  tags: jenkins,unauthorized,rce
+
+http:
+- raw:
+  - |
+    @timeout: 15s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "Dashboard"
+        - "Jenkins"
+      condition: and
+
+- raw:
+  - |
+    @timeout: 15s
+    GET /script HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 3
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "Script Console"
+      condition: and

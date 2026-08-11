@@ -1,0 +1,44 @@
+id: elasticsearch-unauthorized
+
+info:
+  name: Elasticsearch 未授权访问漏洞
+  author: god
+  severity: high
+  description: Elasticsearch 服务未设置认证，可读取集群所有数据
+  metadata:
+    fofa-query: app="elastic-Elasticsearch"
+  tags: elasticsearch,unauthorized
+
+http:
+- raw:
+  - |
+    @timeout: 15s
+    GET /_cat/indices?v HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "health"
+        - "status"
+        - "index"
+      condition: and
+
+- raw:
+  - |
+    @timeout: 15s
+    GET / HTTP/1.1
+    Host: {{Hostname}}
+
+  max-redirects: 0
+  matchers-condition: and
+  matchers:
+    - type: word
+      part: body
+      words:
+        - "cluster_name"
+        - "tagline"
+      condition: and
