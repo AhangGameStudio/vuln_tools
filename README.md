@@ -6,7 +6,7 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![POC Count](https://img.shields.io/badge/POCs-90+-orange.svg)](pocs/)
+[![POC Count](https://img.shields.io/badge/POCs-78-orange.svg)](pocs/)
 
 </div>
 
@@ -14,16 +14,18 @@
 
 ## 📖 项目简介
 
-aivuln CLI 是一个基于 Python 的自动化漏洞扫描工具，完全兼容 **Nuclei YAML 模板格式**。工具采用模块化设计，支持批量 POC 执行、智能匹配、AI 辅助分析等功能。
+aivuln CLI 是一个基于 Python 的自动化漏洞扫描工具，完全兼容 **Nuclei YAML 模板格式**。工具采用模块化设计，支持批量 POC 执行、智能匹配、AI 辅助分析、AI 动态生成 Payload、WAF 探测与绕过等功能。
 
 ### ✨ 核心特性
 
-- 🎯 **Nuclei 兼容** - 完全支持 Nuclei YAML POC 格式
-- 🔄 **批量扫描** - 自动加载并执行多个 POC，按危害级别排序
-- 🤖 **AI 分析** - 集成 AI 辅助漏洞分析（支持 OpenAI 兼容 API）
-- 🌐 **编码自适应** - 自动检测 GBK/GB2312 编码，解决中文乱码问题
+- 🎯 **Nuclei 兼容** - 完全支持 Nuclei YAML POC 格式（raw 原始报文 / word / status / regex / dsl 匹配器）
+- 🔄 **批量扫描** - 自动加载并执行多个 POC，按危害级别（critical → low）排序，间隔可配置
+- 🤖 **AI 分析** - 集成 AI 辅助漏洞分析（支持任意 OpenAI 兼容 API）
+- 🧠 **AI 动态 Payload** - 扫描过程中 AI 根据 POC 上下文实时生成针对性 Payload 并执行测试
+- 🛡️ **WAF 探测与绕过** - 自动识别目标 WAF 类型，4 种变形规则尝试绕过（URL 编码 / 双重编码 / 大小写 / 注释符）
+- 🔍 **Payload 挖掘** - 独立的 Payload 模糊测试模式（sqli / xss / lfi / cmdi）
+- 🌐 **编码自适应** - 自动检测 GBK/GB2312/GB18030/CP936 编码并转码为 UTF-8，解决中文乱码问题
 - ⚡ **灵活配置** - 支持自定义 POC 目录、执行间隔、HTTP 超时等
-- 📊 **结构化输出** - 清晰的扫描结果展示，包含证据和状态码
 
 ---
 
@@ -59,6 +61,9 @@ python vuln_cli.py scan http://target.com
 # 列出所有 POC
 python vuln_cli.py list
 
+# WAF 探测与绕过测试
+python vuln_cli.py waf http://target.com
+
 # 查看帮助
 python vuln_cli.py help
 ```
@@ -78,22 +83,34 @@ python vuln_cli.py scan http://192.168.1.100
 #### 高级选项
 
 ```bash
-# 指定 POC 目录
+# 指定 POC 目录（默认 E:\AI-Tools\pocs）
 python vuln_cli.py scan http://target.com --pocs ./my_pocs
 
 # 调整执行间隔（默认 2 秒）
 python vuln_cli.py scan http://target.com --interval 1
 
-# 启用 AI 分析
+# 启用 AI 分析（扫描结束后分析结果）
 python vuln_cli.py scan http://target.com --ai
 
+# 启用 AI 动态生成 Payload（每 10 个 POC 生成一次）
+python vuln_cli.py scan http://target.com --ai-payload
+
+# 调整 AI Payload 生成频率（每 5 个 POC）
+python vuln_cli.py scan http://target.com --ai-payload --ai-payload-interval 5
+
+# 扫描前自动探测目标 WAF
+python vuln_cli.py scan http://target.com --waf-detect
+
+# 探测 WAF 并自动尝试变形绕过被拦截的请求
+python vuln_cli.py scan http://target.com --waf-detect --bypass
+
 # 组合使用
-python vuln_cli.py scan http://target.com --pocs ./custom_pocs --interval 1 --ai
+python vuln_cli.py scan http://target.com --pocs ./custom_pocs --interval 1 --ai --ai-payload --waf-detect --bypass
 ```
 
-### 2. 配置 AI 分析
+### 2. 配置 AI
 
-工具支持集成 AI 进行漏洞分析，需要先配置 API：
+工具支持集成 AI 进行漏洞分析与动态 Payload 生成，需要先配置 API：
 
 ```bash
 # 方式一：使用快捷命令
@@ -104,13 +121,112 @@ python vuln_cli.py /AI配置
 ```
 
 按提示输入：
-- **API_URL**: API 地址（如 `https://api.openai.com/v1`）
+- **API_URL**: API 地址（如 `https://api.deepseek.com`）
 - **API_KEY**: API 密钥
-- **MODEL**: 模型名称（如 `gpt-4`, `gpt-3.5-turbo`）
+- **MODEL**: 模型名称（如 `deepseek-chat`, `gpt-4`, `gpt-3.5-turbo`）
+
+> **提示**：DeepSeek 用户请使用官方模型名 `deepseek-chat` 或 `deepseek-reasoner`，使用不存在的模型名会导致请求超时或返回空内容。
 
 配置文件保存在 `.config/ai_config.json`
 
-### 3. 查看 POC 列表
+### 3. AI 动态生成 Payload
+
+扫描过程中，AI 会结合当前 POC 的漏洞类型和目标 URL，实时生成针对性的攻击 Payload 并立即执行测试：
+
+```
+  [AI] 生成针对性 Payload...
+    │ 目标      : http://target.com
+    │ POC上下文 : 当前POC: xxx - 某漏洞 (critical)
+    │ 调用AI生成 Payload 中 (通常 5~30s，请耐心等待)...
+    │ 请求: POST https://api.deepseek.com/chat/completions
+    │ 模型: deepseek-chat (max_tokens=600)
+    │ ✓ AI 响应完成，耗时 5.1s
+    │ 解析: 共 3 行，识别出 3 条有效 Payload
+    │   [1] POST|/upload|filename=evil.jsp&file=...|...
+    │ 已保存临时文件: E:\AI-Tools\vuln_tools\.temp\ai_payload_xxx.txt
+    │ 执行 Payload 测试中...
+    │ [1/3] POST http://target.com/upload ✓ 命中!
+```
+
+- 生成的 Payload 保存在 `.temp/` 临时目录，扫描结束后自动清理
+- 生成的临时文件供审计追溯，执行结果同样计入漏洞统计
+
+### 4. WAF 探测与绕过
+
+当目标部署了 WAF 时，POC 的攻击请求可能被拦截导致漏报。工具提供 WAF 探测与绕过能力。
+
+#### 4.1 WAF 探测
+
+```bash
+python vuln_cli.py waf http://target.com
+```
+
+工具会发送 5 类无害攻击特征探针（SQL 注入 / UNION / 路径穿越 / XSS / 命令注入），与基线请求对比判断是否存在 WAF：
+
+```
+[WAF探测] 基线: HTTP 200, 309124B
+[WAF探测] SQL注入(SLEEP): HTTP 423, 659B -> 拦截!
+[WAF探测] 路径穿越: HTTP 423, 659B -> 拦截!
+...
+[!] 检测到 WAF! 类型: 自定义WAF(423封锁) 拦截状态码: 423
+```
+
+#### 4.2 绕过变体测试
+
+探测到 WAF 后，自动测试 4 种绕过变体的有效性：
+
+| 变体 | 原理 | 适用场景 |
+|------|------|---------|
+| `urlencode` | `..` → `%2e%2e`，利用 WAF 不解码编码点号的缺陷 | 路径穿越类 |
+| `double` | 双重 URL 编码，利用 WAF 只解码一次的缺陷 | 通用 |
+| `mixedcase` | 大小写混淆，绕过大小写敏感规则 | SQL 关键字 |
+| `sqlcomment` | `--`→`/*`、空格→`/**/`，绕过基于空格的规则 | SQL 注入 |
+
+```
+  [*] 测试 WAF 绕过变体...
+    urlencode    ✓ 绕过成功
+    double       ✗ 仍被拦截
+    ...
+```
+
+#### 4.3 扫描中自动绕过
+
+```bash
+# 扫描前探测 WAF，被拦截的请求自动尝试 4 种变形重试
+python vuln_cli.py scan http://target.com --waf-detect --bypass
+```
+
+绕过成功后命中的漏洞会标注变形方式：
+
+```
+[1/78] 某路径穿越漏洞 [HIGH] ✓ 命中! (1 个发现)
+    → http://target.com/portal/%2e%2e/%2e%2e/etc/passwd (HTTP 200)
+    证据: root:x:0:0...
+    [绕过] 通过 [urlencode] 变形绕过WAF命中!
+```
+
+### 5. Payload 挖掘模式
+
+使用预设 Payload 对目标进行模糊测试：
+
+```bash
+# SQL 注入挖掘
+python vuln_cli.py payload "http://target.com/page?id=1" --type sqli
+
+# XSS 挖掘
+python vuln_cli.py payload "http://target.com/search?q=test" --type xss
+
+# 文件包含挖掘
+python vuln_cli.py payload "http://target.com/index.php?file=test" --type lfi
+
+# 命令注入挖掘（自定义间隔）
+python vuln_cli.py payload "http://target.com/ping?host=127.0.0.1" --type cmdi --interval 1
+
+# 使用自定义 Payload 文件
+python vuln_cli.py payload "http://target.com/page?id=1" --type sqli --file ./my_payloads.txt
+```
+
+### 6. 查看 POC 列表
 
 ```bash
 python vuln_cli.py list
@@ -127,7 +243,7 @@ apache-log4j2-rce-CVE-2021-44228             Log4j2 JNDI 注入 RCE             
 shiro-rememberme-deserialization             Shiro RememberMe 反序列化        HIGH
 redis-unauthorized                           Redis 未授权访问                 MEDIUM
 ...
-共 93 个 POC
+共 78 个 POC
 ```
 
 ---
@@ -149,7 +265,9 @@ info:
 
 http:
   - method: GET
-    path: "{{BaseURL}}/vulnerable/path"
+    path:
+      - "{{BaseURL}}/vulnerable/path"
+    matchers-condition: and
     matchers:
       - type: word
         words:
@@ -165,6 +283,7 @@ http:
 | `{{Hostname}}` | 目标主机名（如 `target.com`） |
 | `{{randstr}}` | 随机字符串 |
 | `{{rand}}` | 随机数字 |
+| `{{interactsh-url}}` | OAST 外带交互域名（DNS 回连验证） |
 
 ### 匹配器类型
 
@@ -187,7 +306,6 @@ matchers:
       - "error"
       - "exception"
     part: body          # body/header
-    condition: and      # and/or
 ```
 
 #### 3. Regex 匹配器
@@ -211,9 +329,20 @@ matchers:
     condition: and
 ```
 
+#### 5. 组合匹配（matchers-condition）
+
+```yaml
+matchers-condition: and    # and: 全部命中才算 / or: 任一命中即可
+matchers:
+  - type: status
+    status: [200]
+  - type: word
+    words: ["root:x:"]
+```
+
 ### Raw HTTP 请求
 
-支持原始 HTTP 报文格式：
+支持原始 HTTP 报文格式（可携带完整 Header）：
 
 ```yaml
 http:
@@ -222,9 +351,9 @@ http:
         POST /api/login HTTP/1.1
         Host: {{Hostname}}
         Content-Type: application/json
-        
+
         {"username":"admin","password":"123456"}
-    
+
     matchers:
       - type: word
         words:
@@ -239,14 +368,14 @@ http:
       - |
         GET /step1 HTTP/1.1
         Host: {{Hostname}}
-      
+
       - |
         POST /step2 HTTP/1.1
         Host: {{Hostname}}
         Content-Type: application/json
-        
+
         {"token":"{{extracted_token}}"}
-    
+
     matchers:
       - type: status
         status:
@@ -262,22 +391,29 @@ http:
 ```
 ============================================================
   目标: http://192.168.1.100
-  POC 数量: 93
+  POC 数量: 78
   间隔: 2s
   AI 分析: 关闭
+  AI Payload: 关闭
+  WAF 探测: 开启
+  WAF 绕过: 开启
 ============================================================
 
-[1/93] Log4j2 JNDI 注入 RCE [CRITICAL] ✓ 命中! (1 个发现)
+  [WAF探测] 正在检测目标防护...
+  [!] 检测到WAF: 自定义WAF(423封锁) (拦截状态码 423)
+  [*] 已启用绕过模式，被拦截的请求将自动尝试变形重试
+
+[1/78] Log4j2 JNDI 注入 RCE [CRITICAL] ✓ 命中! (1 个发现)
     → http://192.168.1.100/api (HTTP 200)
     证据: {"status":"success","data":"..."}
 
-[2/93] Shiro RememberMe 反序列化 [HIGH] ✗ 未命中
+[2/78] Shiro RememberMe 反序列化 [HIGH] ✗ 未命中
 
 ...
 
 ============================================================
   扫描完成!
-  总请求数: 186
+  总请求数: 156
   发现漏洞: 3
   按危害级别: CRITICAL:1, HIGH:2
 ============================================================
@@ -298,13 +434,6 @@ http:
    - 风险等级：极高
    - 利用难度：低
    - 修复建议：立即升级 Log4j 至 2.17.1+ 版本
-
-2. [HIGH] Shiro RememberMe 反序列化
-   - 风险等级：高
-   - 利用难度：中
-   - 修复建议：升级 Shiro 至 1.8.0+ 并更换默认密钥
-
-...
 ```
 
 ---
@@ -341,6 +470,7 @@ python vuln_cli.py scan http://target.com --interval 5
 检测方式：
 1. HTTP Content-Type 头中的 charset
 2. HTML meta 标签中的 charset
+3. 内容字节流自动嗅探
 
 ---
 
@@ -348,12 +478,15 @@ python vuln_cli.py scan http://target.com --interval 5
 
 ```
 vuln_tools/
-├── vuln_cli.py              # 主程序
+├── vuln_cli.py              # 主程序（扫描/AI/WAF/Payload 挖掘）
+├── zh.py                    # 辅助工具集（网页探活/下载/域名匹配/漏洞URL匹配）
 ├── requirements.txt         # 依赖清单
-├── README.md               # 项目说明
-├── .config/                # 配置文件目录
-│   └── ai_config.json      # AI 配置
-└── pocs/                   # POC 文件目录
+├── README.md                # 项目说明
+├── .config/                 # 配置文件目录
+│   └── ai_config.json      # AI 配置（API_URL/API_KEY/MODEL）
+├── .temp/                   # AI 临时 Payload 目录（扫描后自动清理）
+├── payloads/                # Payload 文件目录（sqli/xss/lfi/cmdi 等）
+└── pocs/                    # POC 文件目录（默认在 E:\AI-Tools\pocs）
     ├── apache-log4j2-rce-CVE-2021-44228.yaml
     ├── shiro-rememberme-deserialization.yaml
     ├── redis-unauthorized.yaml
@@ -371,25 +504,37 @@ A: 使用 `--interval` 参数调整间隔：
 python vuln_cli.py scan http://target.com --interval 0.5
 ```
 
-### Q: AI 分析报错？
+### Q: AI 调用超时或卡住？
 
 A: 检查以下几点：
-1. API_URL 是否正确（末尾不要有 `/`）
+1. API_URL 是否正确（DeepSeek 官方为 `https://api.deepseek.com`，末尾不要有 `/v1`）
 2. API_KEY 是否有效
-3. MODEL 名称是否正确
+3. **MODEL 名称是否正确**（DeepSeek 请用 `deepseek-chat`，不存在的模型名会超时或返回空内容）
 4. 网络连接是否正常
+5. 工具已内置 45 秒超时和禁用自动重试，错误会快速暴露
+
+### Q: AI 返回空内容/生成 Payload 失败？
+
+A: 通常是模型名无效（如 reasoner 类模型思考过程耗尽 token）。请改用官方对话模型，如 `deepseek-chat`。
+
+### Q: 扫描总是"未命中"？
+
+A: 可能是以下原因：
+1. 目标确实没有对应漏洞（POC 库覆盖的是用友/泛微/海康等特定系统）
+2. **目标部署了 WAF**，攻击请求被拦截 → 用 `--waf-detect` 探测，`--bypass` 尝试绕过
+3. 使用 `waf` 命令可以单独测试目标防护情况
 
 ### Q: 如何添加自定义 POC？
 
-A: 将 YAML 文件放入 `pocs/` 目录即可，工具会自动加载。
+A: 将 YAML 文件放入 `E:\AI-Tools\pocs` 目录即可，工具会自动加载。
 
 ### Q: 扫描结果有乱码？
 
-A: 工具已内置编码检测，如仍有问题，请检查目标网站的实际编码。
+A: 工具已内置编码检测（GBK/GB2312/GB18030/CP936 自动转码 UTF-8），如仍有问题，请检查目标网站的实际编码。
 
 ### Q: 支持 HTTPS 吗？
 
-A: 支持，工具会自动处理 SSL 证书验证。
+A: 支持，工具会自动处理 SSL 证书验证并忽略自签名证书警告。
 
 ---
 
@@ -401,6 +546,7 @@ A: 支持，工具会自动处理 SSL 证书验证。
 2. **责任自负** - 使用本工具产生的任何法律后果由使用者自行承担
 3. **道德使用** - 请勿将本工具用于非法用途
 4. **风险提示** - 大量扫描可能对目标造成压力，请在生产环境谨慎使用
+5. **WAF 绕过提示** - 绕过防护进行未授权测试同样违法，仅限授权范围内使用
 
 **All operations must ensure legal authorization for the target. The above PoC is for authorized verification only. Unauthorized execution is illegal.**
 
