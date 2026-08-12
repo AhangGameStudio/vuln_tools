@@ -559,7 +559,7 @@ def evaluate_matchers(req: POCRequest, resp: dict) -> bool:
         return all(m.match(resp["status_code"], resp["body"], resp["headers"]) for m in req.matchers)
 
 # ─── 扫描调度 ───────────────────────────────────────────────
-def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10, waf_detect: bool = False, bypass: bool = False) -> list:
+def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10, waf_detect: bool = False, bypass: bool = False, sensitive: bool = False) -> list:
     """批量扫描目标"""
     # 按危害级别排序
     pocs_sorted = sorted(pocs, key=lambda p: p.severity_rank())
@@ -572,6 +572,7 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     print(f"  AI Payload: {'开启' if ai_payload else '关闭'}")
     print(f"  WAF 探测: {'开启' if waf_detect else '关闭'}")
     print(f"  WAF 绕过: {'开启' if bypass else '关闭'}")
+    print(f"  敏感文件扫描: {'开启' if sensitive else '关闭'}")
     if ai_payload:
         print(f"  AI Payload 间隔: 每 {ai_payload_interval} 个POC")
     print(f"{'='*60}\n")
@@ -596,6 +597,14 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     temp_payload_files = []  # 记录临时payload文件
     ai_configured = None  # AI配置状态缓存，None=未检查
 
+    # 敏感文件扫描（POC 扫描前）
+    if sensitive:
+        sens_findings = scan_sensitive_files(target_url, interval)
+        if sens_findings:
+            all_findings.extend(sens_findings)
+            print(f"\n  {c_red(f'[!] 敏感文件扫描发现 {len(sens_findings)} 个问题, 综合风险等级: {summarize_risk(sens_findings)}')}")
+        print()
+
     for i, poc in enumerate(pocs_sorted):
         print(f"[{i+1}/{len(pocs_sorted)}] {poc.name} [{poc.severity.upper()}]", end=" ")
 
@@ -603,7 +612,7 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
         req_count += len(poc.requests)
 
         if findings:
-            print(f"✓ 命中! ({len(findings)} 个发现)")
+            print(f"{c_red('✓ 命中!')} ({len(findings)} 个发现)")
             for f in findings:
                 print(f"    → {f['url']} (HTTP {f['status_code']})")
                 print(f"    证据: {f['evidence'][:100]}")
@@ -677,13 +686,16 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     print(f"\n{'='*60}")
     print(f"  扫描完成!")
     print(f"  总请求数: {req_count}")
-    print(f"  发现漏洞: {len(all_findings)}")
     if all_findings:
+        print(f"  {c_red(f'发现漏洞: {len(all_findings)}')}")
         by_sev = {}
         for f in all_findings:
             sev = f["severity"]
             by_sev[sev] = by_sev.get(sev, 0) + 1
-        print(f"  按危害级别: {', '.join(f'{k.upper()}:{v}' for k, v in sorted(by_sev.items()))}")
+        sev_str = ", ".join(f"{c_red(k.upper())}:{v}" if k in ("CRITICAL", "HIGH") else f"{k.upper()}:{v}" for k, v in sorted(by_sev.items()))
+        print(f"  按危害级别: {sev_str}")
+    else:
+        print(f"  发现漏洞: 0")
     print(f"{'='*60}\n")
 
     return all_findings
@@ -1337,6 +1349,7 @@ def cmd_scan(args):
     ai_payload_interval = args.ai_payload_interval
     waf_detect = args.waf_detect
     bypass = args.bypass
+    sensitive = args.sensitive
 
     print(f"[*] 加载 POC 库: {poc_dir}")
     pocs = load_pocs(poc_dir)
@@ -1344,7 +1357,7 @@ def cmd_scan(args):
         print("[!] 未找到 POC，退出")
         return
 
-    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval, waf_detect, bypass)
+    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval, waf_detect, bypass, sensitive)
 
 def cmd_waf(args):
     """waf 命令: 探测目标WAF + 测试绕过"""
@@ -1401,6 +1414,146 @@ def test_waf_bypass(target_url: str, timeout: int = 10) -> dict:
             result["details"][mode] = False
     return result
 
+# ─── 彩色输出 ───────────────────────────────────────────────
+RED = "\033[31m"
+YELLOW = "\033[33m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+def enable_color():
+    """启用 Windows 控制台 ANSI 彩色输出"""
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+
+def c_red(s: str) -> str:
+    return f"{RED}{s}{RESET}"
+
+def c_green(s: str) -> str:
+    return f"{GREEN}{s}{RESET}"
+
+def c_yellow(s: str) -> str:
+    return f"{YELLOW}{s}{RESET}"
+
+def c_cyan(s: str) -> str:
+    return f"{CYAN}{s}{RESET}"
+
+# ─── 敏感文件扫描引擎 ───────────────────────────────────────
+# 格式: (路径, 描述, 检测方式, 匹配特征)
+# 检测方式: "word"=body包含关键字(小写匹配), "binary"=body_bytes魔数匹配
+SENSITIVE_FILES = [
+    ("/robots.txt", "robots.txt 爬虫协议(站点结构泄露)", "word", ["user-agent", "disallow", "allow"]),
+    ("/sitemap.xml", "sitemap.xml 站点地图(页面清单泄露)", "word", ["urlset", "<url>", "sitemap"]),
+    ("/.env", ".env 环境变量(密钥/数据库凭据泄露!)", "word", ["app_key", "db_", "secret", "password", "token"]),
+    ("/.git/HEAD", ".git/HEAD Git仓库暴露(源码泄露!)", "word", ["ref: refs/"]),
+    ("/.git/config", ".git/config Git仓库暴露(源码泄露!)", "word", ["repositoryformatversion", "[core]"]),
+    ("/backup.zip", "backup.zip 网站备份压缩包", "binary", b"PK\x03\x04"),
+    ("/backup.sql", "backup.sql 数据库备份", "word", ["create table", "insert into", "-- mysql", "dump"]),
+    ("/.htaccess", ".htaccess Apache配置(重写规则泄露)", "word", ["rewriterule", "options", "deny from"]),
+    ("/config.php", "config.php 配置文件(凭据泄露)", "word", ["<?php", "db_", "password"]),
+    ("/wp-config.php", "wp-config.php WordPress配置(凭据泄露!)", "word", ["db_password", "db_name", "auth_key"]),
+    ("/phpinfo.php", "phpinfo.php PHP环境信息泄露", "word", ["php version", "phpinfo()", "configuration"]),
+    ("/server-status", "server-status Apache状态页", "word", ["apache server status", "scoreboard"]),
+    ("/adminer.php", "adminer.php 数据库管理工具暴露", "word", ["adminer", "login"]),
+    ("/logs/error.log", "logs/error.log 错误日志泄露", "word", ["error", "exception", "stack trace", "fatal"]),
+    ("/WEB-INF/web.xml", "WEB-INF/web.xml Java配置泄露", "word", ["web-app", "<servlet"]),
+    ("/actuator", "Spring Actuator 监控端点", "word", ["_links", "health", "status"]),
+]
+
+def scan_sensitive_files(target_url: str, interval: float = 1.0, timeout: int = 10, verbose: bool = True) -> list:
+    """扫描目标常见敏感文件/路径，命中项使用红色字体标注"""
+    base = target_url.rstrip("/")
+    findings = []
+
+    if verbose:
+        print(f"\n  [*] 敏感文件扫描: {target_url} (共 {len(SENSITIVE_FILES)} 个路径)")
+        print(f"  {'-'*60}")
+
+    for i, (path, desc, stype, feature) in enumerate(SENSITIVE_FILES, 1):
+        resp = http_request("GET", base + path, {}, "", timeout, 3)
+        hit = False
+        evidence = ""
+        if resp["status_code"] == 200 and resp["body_bytes"]:
+            if stype == "binary":
+                if resp["body_bytes"][:4] == feature:
+                    hit = True
+                    evidence = f"二进制文件(魔数 {feature.decode('latin1')})"
+            else:
+                low = resp["body"].lower()
+                for kw in feature:
+                    if kw in low:
+                        hit = True
+                        evidence = f"关键字匹配: {kw}"
+                        break
+        # 403 = 路径存在但被禁止访问（Apache 默认拒绝 .env/.htaccess/.git 等）
+        elif resp["status_code"] == 403 and stype != "binary":
+            hit = True
+            evidence = "路径存在(HTTP 403 禁止访问)"
+
+        if hit:
+            sev = "CRITICAL" if desc.endswith("!") else "HIGH"
+            if evidence.startswith("路径存在"):
+                sev = "MEDIUM"  # 403仅证明存在，风险降级
+            finding = {
+                "path": path,
+                "name": desc,
+                "severity": sev,
+                "target": target_url,
+                "url": resp["url"],
+                "status_code": resp["status_code"],
+                "evidence": evidence,
+                "timestamp": datetime.now().isoformat(),
+            }
+            findings.append(finding)
+            print(f"  {c_red(f'[!] 发现敏感文件: {path} - {desc}')} {c_red(f'[{sev}]')}")
+            print(f"      {c_red('→')} {resp['url']} (HTTP {resp['status_code']}, {evidence})")
+        else:
+            print(f"  [ ] {path} (HTTP {resp['status_code']})")
+
+        if i < len(SENSITIVE_FILES):
+            time.sleep(interval)
+
+    return findings
+
+def summarize_risk(findings: list) -> str:
+    """汇总风险等级：存在CRITICAL则CRITICAL，否则按最高级别"""
+    if any(f["severity"] == "CRITICAL" for f in findings):
+        return c_red("CRITICAL")
+    if any(f["severity"] == "HIGH" for f in findings):
+        return c_red("HIGH")
+    if any(f["severity"] == "MEDIUM" for f in findings):
+        return c_yellow("MEDIUM")
+    return "LOW"
+
+def cmd_sensitive(args):
+    """sensitive 命令: 敏感文件扫描"""
+    target = args.target
+    interval = args.interval
+
+    print(f"\n{'='*60}")
+    print(f"  敏感文件扫描: {target}")
+    print(f"{'='*60}\n")
+
+    findings = scan_sensitive_files(target, interval)
+
+    print(f"\n{'='*60}")
+    if findings:
+        print(f"  {c_red(f'[!] 发现 {len(findings)} 个敏感文件/路径, 综合风险等级: {summarize_risk(findings)}')}")
+        print(f"  {'='*60}")
+        for f in findings:
+            print(f"  {c_red('[!]')} {f['path']} - {f['name']} [{f['severity']}]")
+    else:
+        print(f"  [*] 未发现敏感文件")
+        print(f"  {'='*60}")
+    print(f"{'='*60}\n")
+    return findings
+
 def cmd_payload(args):
     """payload 命令"""
     target = args.target
@@ -1446,6 +1599,7 @@ aivuln CLI — Python 版漏洞扫描工具
   python vuln_cli.py scan <target> [选项]       扫描目标（POC 模式）
   python vuln_cli.py payload <target> [选项]    Payload 挖掘模式
   python vuln_cli.py waf <target>               WAF 探测与绕过测试
+  python vuln_cli.py sensitive <target>         敏感文件扫描
   python vuln_cli.py list [选项]                列出 POC
   python vuln_cli.py /ai                        配置 AI
   python vuln_cli.py /AI配置                    配置 AI（中文）
@@ -1459,6 +1613,10 @@ scan 选项:
   --ai-payload-interval <n> 每隔 n 个 POC 生成一次 AI Payload (默认: 10)
   --waf-detect              扫描前自动探测目标 WAF
   --bypass                  请求被 WAF 拦截时自动尝试变形绕过重试
+  --sensitive               POC 扫描前先进行敏感文件扫描
+
+sensitive 选项:
+  --interval <sec>  请求间隔 (默认: 1 秒)
 
 payload 选项:
   --type <type>     Payload 类型: sqli/xss/lfi/cmdi (必填)
@@ -1472,13 +1630,17 @@ payload 选项:
   python vuln_cli.py scan http://target.com --ai-payload --ai-payload-interval 5
   python vuln_cli.py scan http://target.com --waf-detect
   python vuln_cli.py scan http://target.com --waf-detect --bypass
+  python vuln_cli.py scan http://target.com --sensitive
   python vuln_cli.py waf http://target.com
+  python vuln_cli.py sensitive http://target.com
   python vuln_cli.py payload "http://target.com/page?id=1" --type sqli
   python vuln_cli.py payload "http://target.com/search?q=test" --type xss --interval 1
   python vuln_cli.py /ai
 """)
 
 def main():
+    enable_color()  # 启用 Windows 控制台彩色输出
+
     # 处理 /ai 和 /AI配置 快捷命令
     if len(sys.argv) > 1 and sys.argv[1] in ("/ai", "/AI配置"):
         config_ai_interactive()
@@ -1497,10 +1659,16 @@ def main():
     p_scan.add_argument("--ai-payload-interval", type=int, default=10, help="每隔多少个 POC 生成一次 AI Payload（默认: 10）")
     p_scan.add_argument("--waf-detect", action="store_true", help="扫描前自动探测目标 WAF")
     p_scan.add_argument("--bypass", action="store_true", help="请求被 WAF 拦截时自动尝试变形绕过重试")
+    p_scan.add_argument("--sensitive", action="store_true", help="POC 扫描前先进行敏感文件扫描")
 
     # waf
     p_waf = subparsers.add_parser("waf", help="WAF 探测与绕过测试")
     p_waf.add_argument("target", help="目标 URL")
+
+    # sensitive
+    p_sensitive = subparsers.add_parser("sensitive", help="敏感文件扫描")
+    p_sensitive.add_argument("target", help="目标 URL")
+    p_sensitive.add_argument("--interval", type=float, default=1.0, help="请求间隔（秒）")
 
     # payload
     p_payload = subparsers.add_parser("payload", help="Payload 挖掘模式")
@@ -1522,6 +1690,8 @@ def main():
         cmd_scan(args)
     elif args.command == "waf":
         cmd_waf(args)
+    elif args.command == "sensitive":
+        cmd_sensitive(args)
     elif args.command == "payload":
         cmd_payload(args)
     elif args.command == "list":

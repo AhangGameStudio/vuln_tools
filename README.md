@@ -24,6 +24,8 @@ aivuln CLI 是一个基于 Python 的自动化漏洞扫描工具，完全兼容 
 - 🧠 **AI 动态 Payload** - 扫描过程中 AI 根据 POC 上下文实时生成针对性 Payload 并执行测试
 - 🛡️ **WAF 探测与绕过** - 自动识别目标 WAF 类型，4 种变形规则尝试绕过（URL 编码 / 双重编码 / 大小写 / 注释符）
 - 🔍 **Payload 挖掘** - 独立的 Payload 模糊测试模式（sqli / xss / lfi / cmdi）
+- 📂 **敏感文件扫描** - 探测 robots.txt / .env / .git / 备份文件等 16 个敏感路径
+- 🔴 **红色标注** - 发现漏洞用红色字体高亮显示（支持 Windows 控制台 ANSI）
 - 🌐 **编码自适应** - 自动检测 GBK/GB2312/GB18030/CP936 编码并转码为 UTF-8，解决中文乱码问题
 - ⚡ **灵活配置** - 支持自定义 POC 目录、执行间隔、HTTP 超时等
 
@@ -63,6 +65,9 @@ python vuln_cli.py list
 
 # WAF 探测与绕过测试
 python vuln_cli.py waf http://target.com
+
+# 敏感文件扫描（robots.txt/.env/.git等）
+python vuln_cli.py sensitive http://target.com
 
 # 查看帮助
 python vuln_cli.py help
@@ -104,8 +109,11 @@ python vuln_cli.py scan http://target.com --waf-detect
 # 探测 WAF 并自动尝试变形绕过被拦截的请求
 python vuln_cli.py scan http://target.com --waf-detect --bypass
 
+# POC 扫描前先进行敏感文件扫描
+python vuln_cli.py scan http://target.com --sensitive
+
 # 组合使用
-python vuln_cli.py scan http://target.com --pocs ./custom_pocs --interval 1 --ai --ai-payload --waf-detect --bypass
+python vuln_cli.py scan http://target.com --pocs ./custom_pocs --interval 1 --ai --ai-payload --waf-detect --bypass --sensitive
 ```
 
 ### 2. 配置 AI
@@ -226,7 +234,50 @@ python vuln_cli.py payload "http://target.com/ping?host=127.0.0.1" --type cmdi -
 python vuln_cli.py payload "http://target.com/page?id=1" --type sqli --file ./my_payloads.txt
 ```
 
-### 6. 查看 POC 列表
+### 6. 敏感文件扫描
+
+> ⚠️ **警告：敏感文件扫描大部分为误报，谨慎识别！！！**
+>
+> 1. **200 响应也可能是误报** - 某些站点的自定义 404 页面返回 HTTP 200，内容可能包含 `password`/`error` 等特征词，需人工确认页面内容是否为真实文件
+> 2. **403 仅证明"路径存在或被防护拦截"** - 很多站点对任意不存在路径统一返回 403（如部分 WAF/服务器配置），不代表敏感文件真实存在
+> 3. **需人工验证** - 建议对命中的路径手动访问，检查：真实文件内容 / 返回页面是否一致 / 是否有错误页特征，再决定是否报告
+> 4. 综合风险等级为启发式汇总，**不可直接作为漏洞结论**，请结合业务实际判断
+
+探测目标是否存在信息泄露的敏感文件/路径（robots.txt、.env、.git、备份文件、配置文件等 16 个常见路径）：
+
+```bash
+# 独立敏感文件扫描
+python vuln_cli.py sensitive http://target.com
+
+# 调整请求间隔（默认 1 秒）
+python vuln_cli.py sensitive http://target.com --interval 0.3
+
+# 与 POC 扫描结合（先扫敏感文件再扫 POC）
+python vuln_cli.py scan http://target.com --sensitive
+```
+
+判定规则：
+- **HTTP 200 + 内容特征匹配** → 确认泄露（如 `.env` 含 `APP_KEY`/`DB_PASSWORD`，`.git/HEAD` 含 `ref: refs/`，`backup.zip` 为 ZIP 魔数 `PK`）
+- **HTTP 403** → 路径存在但被禁止访问（Apache 默认拒绝 `.env`/`.htaccess`/`.git`），标记 MEDIUM
+- 发现漏洞用**红色字体**标注，并按 CRITICAL/HIGH/MEDIUM 汇总综合风险等级
+
+输出示例：
+
+```
+  [*] 敏感文件扫描: http://target.com (共 16 个路径)
+  ------------------------------------------------------------
+  [!] 发现敏感文件: /robots.txt - robots.txt 爬虫协议(站点结构泄露) [HIGH]
+      → http://target.com/robots.txt (HTTP 200, 关键字匹配: user-agent)
+  [!] 发现敏感文件: /.env - .env 环境变量(密钥/数据库凭据泄露!) [MEDIUM]
+      → http://target.com/.env/ (HTTP 403, 路径存在(HTTP 403 禁止访问))
+  [ ] /backup.zip (HTTP 404)
+  ...
+============================================================
+  [!] 发现 3 个敏感文件/路径, 综合风险等级: HIGH
+============================================================
+```
+
+### 7. 查看 POC 列表
 
 ```bash
 python vuln_cli.py list
@@ -397,13 +448,18 @@ http:
   AI Payload: 关闭
   WAF 探测: 开启
   WAF 绕过: 开启
+  敏感文件扫描: 开启
 ============================================================
 
   [WAF探测] 正在检测目标防护...
   [!] 检测到WAF: 自定义WAF(423封锁) (拦截状态码 423)
   [*] 已启用绕过模式，被拦截的请求将自动尝试变形重试
 
-[1/78] Log4j2 JNDI 注入 RCE [CRITICAL] ✓ 命中! (1 个发现)
+  [*] 敏感文件扫描: http://192.168.1.100 (共 16 个路径)
+  [!] 发现敏感文件: /robots.txt - robots.txt 爬虫协议(站点结构泄露) [HIGH]
+  ...
+
+[1/78] Log4j2 JNDI 注入 RCE [CRITICAL] ✓ 命中! (1 个发现)   ← 红色字体
     → http://192.168.1.100/api (HTTP 200)
     证据: {"status":"success","data":"..."}
 
@@ -414,8 +470,8 @@ http:
 ============================================================
   扫描完成!
   总请求数: 156
-  发现漏洞: 3
-  按危害级别: CRITICAL:1, HIGH:2
+  发现漏洞: 3                              ← 红色字体
+  按危害级别: CRITICAL:1, HIGH:2          ← 红色字体
 ============================================================
 ```
 
@@ -523,6 +579,18 @@ A: 可能是以下原因：
 1. 目标确实没有对应漏洞（POC 库覆盖的是用友/泛微/海康等特定系统）
 2. **目标部署了 WAF**，攻击请求被拦截 → 用 `--waf-detect` 探测，`--bypass` 尝试绕过
 3. 使用 `waf` 命令可以单独测试目标防护情况
+
+### Q: 如何扫描敏感文件/备份文件？
+
+A: 使用 `sensitive` 命令或 `--sensitive` 参数：
+```bash
+python vuln_cli.py sensitive http://target.com
+python vuln_cli.py scan http://target.com --sensitive
+```
+
+### Q: 为什么控制台没有显示红色字体？
+
+A: 工具自动启用 Windows 控制台 ANSI 彩色输出（通过 ctypes 设置 VT 模式）。若使用的终端不支持 ANSI（如旧版 cmd），请使用 Windows Terminal / PowerShell 7+ 或 `pip install colorama`。
 
 ### Q: 如何添加自定义 POC？
 
