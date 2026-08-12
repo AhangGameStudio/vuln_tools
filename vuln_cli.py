@@ -445,6 +445,30 @@ def http_request(method: str, url: str, headers: dict, body: str, timeout: int, 
         return {"status_code": 0, "headers": {}, "body": "", "body_bytes": b"", "url": url, "error": str(e)}
 
 # ─── POC 执行引擎 ───────────────────────────────────────────
+def _extract_match_words(req) -> tuple:
+    """从POC匹配器中提取危害特征词/正则, 供浏览器复现后判定"是否有危害"
+
+    只看内容特征, 忽略状态码/时间延迟等无法在浏览器中复现的条件。
+    :return: (match_words: list[str], match_regex: list[str])
+    """
+    words, regexes = [], []
+    for m in (req.matchers or []):
+        if m.negate:
+            continue  # 取反匹配器不能作为"危害存在"的特征
+        if m.type == "word" and m.words:
+            for w in m.words:
+                s = str(w)
+                if s.lstrip("-").isdigit():
+                    continue  # 纯数字(状态码)不参与内容判定
+                words.append(s)
+        elif m.type == "regex" and m.regex:
+            for p in m.regex:
+                p = p.strip()
+                if p and len(p) < 40 and not p.startswith("duration"):
+                    regexes.append(p)
+    return words[:12], regexes[:6]
+
+
 def run_poc(target_url: str, poc: POC, bypass: bool = False) -> list:
     """对目标执行单个 POC，返回 Finding 列表
     :param bypass: 请求被WAF拦截时，自动尝试绕过变体（URL编码/双重编码/大小写/注释符）
@@ -530,6 +554,8 @@ def run_poc(target_url: str, poc: POC, bypass: bool = False) -> list:
             if not evidence and last_resp["body"]:
                 evidence.append(last_resp["body"][:200])
 
+            match_words, match_regex = _extract_match_words(req)
+
             finding = {
                 "poc_id": poc.id,
                 "target": target_url,
@@ -540,6 +566,13 @@ def run_poc(target_url: str, poc: POC, bypass: bool = False) -> list:
                 "evidence": " | ".join(evidence),
                 "status_code": last_resp["status_code"],
                 "timestamp": datetime.now().isoformat(),
+                # 浏览器复现所需信息 (web模块使用)
+                "request_method": step["method"],
+                "request_body": step["body"] if step["method"] != "GET" else "",
+                "request_headers": dict(step["headers"] or {}),
+                # 危害特征词 (复现时判定"是否有危害", 不看状态码)
+                "match_words": match_words,
+                "match_regex": match_regex,
             }
             if bypass_hit:
                 finding["waf_bypass"] = bypass_hit  # 标记绕过方式
@@ -559,7 +592,7 @@ def evaluate_matchers(req: POCRequest, resp: dict) -> bool:
         return all(m.match(resp["status_code"], resp["body"], resp["headers"]) for m in req.matchers)
 
 # ─── 扫描调度 ───────────────────────────────────────────────
-def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10, waf_detect: bool = False, bypass: bool = False, sensitive: bool = False) -> list:
+def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = False, ai_payload: bool = False, ai_payload_interval: int = 10, waf_detect: bool = False, bypass: bool = False, sensitive: bool = False, browser: bool = False, headless: bool = False) -> list:
     """批量扫描目标"""
     # 按危害级别排序
     pocs_sorted = sorted(pocs, key=lambda p: p.severity_rank())
@@ -573,6 +606,7 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     print(f"  WAF 探测: {'开启' if waf_detect else '关闭'}")
     print(f"  WAF 绕过: {'开启' if bypass else '关闭'}")
     print(f"  敏感文件扫描: {'开启' if sensitive else '关闭'}")
+    print(f"  浏览器复现: {'开启' if browser else '关闭'}{'(无头)' if browser and headless else ''}")
     if ai_payload:
         print(f"  AI Payload 间隔: 每 {ai_payload_interval} 个POC")
     print(f"{'='*60}\n")
@@ -596,6 +630,7 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
     req_count = 0
     temp_payload_files = []  # 记录临时payload文件
     ai_configured = None  # AI配置状态缓存，None=未检查
+    browser_repro_findings = []  # 需要浏览器复现的 POC 命中记录
 
     # 敏感文件扫描（POC 扫描前）
     if sensitive:
@@ -619,6 +654,9 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
                 if f.get("waf_bypass"):
                     print(f"    [绕过] 通过 [{f['waf_bypass']}] 变形绕过WAF命中!")
             all_findings.extend(findings)
+            # 浏览器复现: 只收集 POC 原始命中 (AI 生成的 payload 命中不自动复现)
+            if browser:
+                browser_repro_findings.extend(findings)
         else:
             print("✗ 未命中")
 
@@ -698,6 +736,30 @@ def scan(target_url: str, pocs: list, interval: float = 2.0, ai_analyze: bool = 
         print(f"  发现漏洞: 0")
     print(f"{'='*60}\n")
 
+    # 浏览器自动复现: 逐条弹出浏览器, 停在漏洞页面等待人工确认
+    if browser and browser_repro_findings:
+        print(f"\n  [浏览器复现] 共 {len(browser_repro_findings)} 个命中, 开始自动复现...")
+        print(f"  [浏览器复现] 每个漏洞会打开浏览器, 确认后按回车继续\n")
+        try:
+            import web_reproduce
+            harm_links = web_reproduce.reproduce_all(browser_repro_findings, headless=headless)
+            # 危害链接标注: 浏览器确认存在实际危害的链接
+            if harm_links:
+                print(f"\n  {c_red('='*60)}")
+                print(f"  {c_red('★ 浏览器确认存在实际危害的链接:')}")
+                for h in harm_links:
+                    sev = str(h.get("severity", "")).upper()
+                    nm = h.get("name", "")
+                    hu = h.get("url", "")
+                    print(f"  {c_red(f'    ▶ [{sev}] {nm}')}")
+                    print(f"  {c_red(f'      {hu}')}")
+                print(f"  {c_red('='*60)}\n")
+        except ImportError:
+            print(f"  [!] 未安装 playwright, 请执行: pip install playwright")
+        except Exception as e:
+            print(f"  [浏览器复现] ✗ 复现失败: {e}")
+        print(f"\n  [浏览器复现] 复现完成, 扫描结束")
+
     return all_findings
 
 def execute_ai_payloads(target_url: str, payloads: list, interval: float = 2.0) -> list:
@@ -748,6 +810,11 @@ def execute_ai_payloads(target_url: str, payloads: list, interval: float = 2.0) 
 
             if matched:
                 print(f"✓ 命中! (HTTP {resp['status_code']}, 条件: {match_condition[:40]})")
+                # 从匹配条件中提取危害特征词 (body contains "xxx")
+                mw = []
+                cm = re.search(r'body contains "([^"]+)"', match_condition)
+                if cm:
+                    mw.append(cm.group(1))
                 findings.append({
                     "poc_id": "ai-generated-payload",
                     "target": target_url,
@@ -758,6 +825,12 @@ def execute_ai_payloads(target_url: str, payloads: list, interval: float = 2.0) 
                     "evidence": resp["body"][:200],
                     "status_code": resp["status_code"],
                     "timestamp": datetime.now().isoformat(),
+                    # 补齐浏览器复现所需信息 (修复AI挖漏洞无法浏览器复现的缺陷)
+                    "request_method": method,
+                    "request_body": body,
+                    "request_headers": {"Content-Type": "application/x-www-form-urlencoded"} if method == "POST" else {},
+                    "match_words": mw,
+                    "match_regex": [],
                 })
             else:
                 print(f"✗ 未命中 (HTTP {resp['status_code']})")
@@ -1350,6 +1423,8 @@ def cmd_scan(args):
     waf_detect = args.waf_detect
     bypass = args.bypass
     sensitive = args.sensitive
+    browser = args.browser
+    headless = args.headless
 
     print(f"[*] 加载 POC 库: {poc_dir}")
     pocs = load_pocs(poc_dir)
@@ -1357,7 +1432,7 @@ def cmd_scan(args):
         print("[!] 未找到 POC，退出")
         return
 
-    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval, waf_detect, bypass, sensitive)
+    scan(target, pocs, interval, ai_analyze, ai_payload, ai_payload_interval, waf_detect, bypass, sensitive, browser, headless)
 
 def cmd_waf(args):
     """waf 命令: 探测目标WAF + 测试绕过"""
@@ -1660,6 +1735,8 @@ def main():
     p_scan.add_argument("--waf-detect", action="store_true", help="扫描前自动探测目标 WAF")
     p_scan.add_argument("--bypass", action="store_true", help="请求被 WAF 拦截时自动尝试变形绕过重试")
     p_scan.add_argument("--sensitive", action="store_true", help="POC 扫描前先进行敏感文件扫描")
+    p_scan.add_argument("--browser", action="store_true", help="扫描结束后用浏览器自动复现命中的漏洞")
+    p_scan.add_argument("--headless", action="store_true", help="浏览器复现使用无头模式(不弹窗)")
 
     # waf
     p_waf = subparsers.add_parser("waf", help="WAF 探测与绕过测试")

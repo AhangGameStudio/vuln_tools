@@ -112,6 +112,13 @@ python vuln_cli.py scan http://target.com --waf-detect --bypass
 # POC 扫描前先进行敏感文件扫描
 python vuln_cli.py scan http://target.com --sensitive
 
+# 扫描结束后用浏览器自动复现命中的漏洞（停在页面，人工确认后回车继续）
+# 判定不看状态码，只根据 POC 危害特征词确认"是否有危害"，有危害的链接红色标注
+python vuln_cli.py scan http://target.com --browser
+
+# 浏览器复现使用无头模式（不弹窗，自动化取证）
+python vuln_cli.py scan http://target.com --browser --headless
+
 # 组合使用
 python vuln_cli.py scan http://target.com --pocs ./custom_pocs --interval 1 --ai --ai-payload --waf-detect --bypass --sensitive
 ```
