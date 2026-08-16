@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -1412,6 +1413,252 @@ def fuzz_target(target_url: str, payload_type: str, payloads: list, interval: fl
     return findings
 
 # ─── CLI 入口 ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# batch — 批量 URL 自动化扫描流水线（融合 auto_scan.py 核心功能）
+# 流水线: httpx 存活探测 → 黑名单过滤 → whatweb 指纹 → nuclei 扫描 → 汇总报告
+# 依赖外部工具: httpx / whatweb / nuclei（需在 PATH 中）
+# ═══════════════════════════════════════════════════════════
+BATCH_DEFAULT_THREADS = int(os.environ.get("THREADS", 10))
+BATCH_DEFAULT_NUCLEI_C = int(os.environ.get("NUCLEI_C", 5))
+BATCH_DEFAULT_NUCLEI_RATE = int(os.environ.get("NUCLEI_RATE", 10))
+BATCH_DEFAULT_PROXY = os.environ.get("PROXY", None)
+BATCH_DEFAULT_DELAY = int(os.environ.get("DELAY", 0))
+
+_BATCH_TECH_STACKS = ["ThinkPHP", "WordPress", "Nginx", "Apache", "IIS", "PHP", "Java",
+                      "Python", "Node.js", "React", "Vue.js", "Angular", "jQuery",
+                      "Bootstrap", "Tomcat", "Django", "Flask", "Laravel", "Spring"]
+
+
+def check_tool(tool_name):
+    """检查外部工具是否可用"""
+    try:
+        subprocess.run([tool_name, "-h"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def read_unique_lines(file_path):
+    """去重读取 URL 列表（utf-8 失败自动回退 gbk）"""
+    lines, seen = [], set()
+    for enc in ("utf-8", "gbk"):
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and line not in seen:
+                        seen.add(line)
+                        lines.append(line)
+            return lines
+        except UnicodeDecodeError:
+            continue
+    return lines
+
+
+def batch_filter_alive(alive_file, output_dir, blacklist_titles=None):
+    """按标题黑名单过滤存活目标（排除 Burp Suite 等代理标题）"""
+    if blacklist_titles is None:
+        blacklist_titles = ["Burp Suite Professional", "Burp Suite", "Burp Suite Community"]
+    filtered_file = os.path.join(output_dir, "alive_filtered.txt")
+    keep_count = remove_count = 0
+    try:
+        with open(alive_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        with open(filtered_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if any(kw in line for kw in blacklist_titles):
+                    remove_count += 1
+                else:
+                    f.write(line + "\n")
+                    keep_count += 1
+        print(f"[✓] 存活目标过滤完成: 保留 {keep_count} 个，移除 {remove_count} 个（黑名单标题）")
+        return filtered_file
+    except Exception as e:
+        print(f"[!] 过滤失败: {e}")
+        return alive_file
+
+
+def find_default_template():
+    """查找默认 nuclei 模板目录（当前目录 → 用户目录）"""
+    if os.path.isdir("nuclei-templates"):
+        return "nuclei-templates"
+    home = os.path.expanduser("~")
+    user_templates = os.path.join(home, "nuclei-templates")
+    if os.path.isdir(user_templates):
+        return user_templates
+    return None
+
+
+def step_httpx(input_file, output_dir, threads=10, delay=0, proxy=None, timeout=10):
+    """[1/5] httpx 存活探测"""
+    print(c_yellow("[1/5] 执行存活探测 (httpx)..."))
+    output_file = os.path.join(output_dir, "alive.txt")
+    cmd = ["httpx", "-l", input_file, "-status-code", "-title", "-tech-detect",
+           "-follow-redirects", "-threads", str(threads), "-timeout", str(timeout),
+           "-o", output_file,
+           "-match-code", "200,201,202,203,204,205,206,300,301,302,303,304,305,307,308"]
+    if proxy:
+        cmd.extend(["-proxy", proxy])
+    if delay > 0:
+        cmd.extend(["-delay", str(delay)])
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"[+] 存活探测完成，结果保存至 {output_file}")
+        return output_file
+    except subprocess.CalledProcessError as e:
+        print(c_red(f"[!] httpx 执行失败: {e}"))
+        sys.exit(1)
+
+
+def step_whatweb(alive_file, output_dir):
+    """[2/5] whatweb 指纹识别"""
+    print(c_yellow("[2/5] 执行指纹识别 (whatweb)..."))
+    output_file = os.path.join(output_dir, "fingerprint.txt")
+    cmd = ["whatweb", "-a", "3", "-i", alive_file, "--no-errors", "--output", output_file]
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"[+] 指纹识别完成，结果保存至 {output_file}")
+    except subprocess.CalledProcessError as e:
+        print(c_yellow(f"[!] whatweb 执行失败（可能版本不兼容），跳过指纹识别: {e}"))
+
+
+def step_nuclei(alive_file, output_dir, template_dir=None, severity="critical,high,medium",
+                c=5, rate_limit=10, timeout=15, retries=2, proxy=None, update=False):
+    """[3/5] nuclei 漏洞扫描"""
+    print(c_yellow("[3/5] 执行漏洞扫描 (nuclei)..."))
+    if update:
+        print("更新 nuclei 模板...")
+        try:
+            subprocess.run(["nuclei", "-update-templates"], check=True)
+        except subprocess.CalledProcessError as e:
+            print(c_yellow(f"[!] 模板更新失败: {e}"))
+    output_file = os.path.join(output_dir, "nuclei_results.txt")
+    cmd = ["nuclei", "-l", alive_file]
+    if template_dir:
+        cmd.extend(["-t", template_dir])
+    cmd.extend(["-severity", severity, "-c", str(c), "-rate-limit", str(rate_limit),
+                "-timeout", str(timeout), "-retries", str(retries),
+                "-o", output_file, "-silent", "-stats"])
+    if proxy:
+        cmd.extend(["-proxy", proxy])
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"[+] 漏洞扫描完成，结果保存至 {output_file}")
+    except subprocess.CalledProcessError as e:
+        print(c_red(f"[!] nuclei 执行失败: {e}"))
+
+
+def generate_summary(output_dir):
+    """[4/5] 汇总报告（存活目标 + 技术栈分组 + nuclei 漏洞结果）"""
+    print(c_yellow("[4/5] 生成汇总报告..."))
+    summary_file = os.path.join(output_dir, "summary.txt")
+    vuln_report_file = os.path.join(output_dir, "vulnerabilities.txt")
+
+    tech_groups = {}
+    fp_path = os.path.join(output_dir, "fingerprint.txt")
+    if os.path.exists(fp_path):
+        with open(fp_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                url = line.split(", ")[0]
+                techs = [t for t in _BATCH_TECH_STACKS if t.lower() in line.lower()]
+                key = ", ".join(techs) if techs else "未识别技术栈"
+                tech_groups.setdefault(key, []).append(url)
+
+    with open(summary_file, "w", encoding="utf-8") as out:
+        out.write("=" * 60 + "\n")
+        out.write("自动化扫描汇总报告\n")
+        out.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        out.write("=" * 60 + "\n\n")
+
+        alive_path = os.path.join(output_dir, "alive_filtered.txt")
+        if not os.path.exists(alive_path):
+            alive_path = os.path.join(output_dir, "alive.txt")
+        if os.path.exists(alive_path):
+            out.write(">>> 存活目标 (alive_filtered.txt) <<<\n")
+            with open(alive_path, "r", encoding="utf-8") as f:
+                out.write(f.read())
+            out.write("\n\n")
+
+        out.write(">>> 技术栈分组 (按框架/语言分类) <<<\n")
+        if tech_groups:
+            for tech, urls in tech_groups.items():
+                out.write(f"  [{tech}] 共 {len(urls)} 个目标\n")
+                for u in urls:
+                    out.write(f"    - {u}\n")
+                out.write("\n")
+        else:
+            out.write("  (无指纹信息或无法分组)\n\n")
+
+        nuc_path = os.path.join(output_dir, "nuclei_results.txt")
+        if os.path.exists(nuc_path):
+            out.write(">>> 漏洞扫描 (nuclei_results.txt) <<<\n")
+            with open(nuc_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            out.write(content if content.strip() else "(未发现漏洞)\n")
+            out.write("\n\n")
+            with open(vuln_report_file, "w", encoding="utf-8") as vf:
+                vf.write(content if content.strip() else "未发现漏洞\n")
+        else:
+            out.write(">>> 漏洞扫描 (nuclei_results.txt) 不存在 <<<\n\n")
+
+    print(f"[+] 汇总报告已保存至 {summary_file}")
+    print(f"[+] 漏洞报告已保存至 {vuln_report_file}")
+
+
+def cmd_batch(args):
+    """batch 命令: 批量 URL 列表自动化扫描流水线"""
+    if not os.path.isfile(args.list):
+        print(c_red(f"[!] 文件 {args.list} 不存在"))
+        sys.exit(1)
+
+    output_dir = args.output or f"scan_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    template_dir = args.template or find_default_template()
+    if template_dir:
+        print(f"[*] 使用模板目录: {template_dir}")
+    else:
+        print(c_yellow("[!] 未找到默认模板目录，请使用 --template 指定"))
+
+    for tool in ("httpx", "whatweb", "nuclei"):
+        if not check_tool(tool):
+            print(c_red(f"[!] 未找到 {tool}，请安装后再运行"))
+            if tool in ("httpx", "nuclei"):
+                print(f"    {tool}: https://github.com/projectdiscovery/{tool}")
+            sys.exit(1)
+
+    # 去重输入列表（避免重复请求）
+    dedup_file = os.path.join(output_dir, "input_dedup.txt")
+    unique = read_unique_lines(args.list)
+    with open(dedup_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(unique))
+    print(f"[*] 去重输入: {len(unique)} 个唯一目标 → {dedup_file}")
+
+    print(f"[*] 并发参数: httpx线程={args.threads}, nuclei并发={args.nuclei_c}, 速率={args.nuclei_rate} req/s")
+    if args.proxy:
+        print(f"[*] 使用代理: {args.proxy}")
+
+    start = time.time()
+    alive_file = step_httpx(dedup_file, output_dir, threads=args.threads, delay=args.delay, proxy=args.proxy)
+    keywords = [k.strip() for k in args.filter_keywords.split(",") if k.strip()]
+    alive_filtered = batch_filter_alive(alive_file, output_dir, blacklist_titles=keywords)
+    step_whatweb(alive_filtered, output_dir)
+    step_nuclei(alive_filtered, output_dir, template_dir=template_dir, severity=args.severity,
+                c=args.nuclei_c, rate_limit=args.nuclei_rate, proxy=args.proxy,
+                update=args.update_templates)
+    generate_summary(output_dir)
+
+    print(f"[✓] 批量扫描完成，总耗时 {time.time() - start:.2f} 秒")
+    print(f"    汇总报告: {os.path.join(output_dir, 'summary.txt')}")
+    print(f"    漏洞报告: {os.path.join(output_dir, 'vulnerabilities.txt')}")
+
+
 def cmd_scan(args):
     """scan 命令"""
     target = args.target
@@ -1672,6 +1919,7 @@ aivuln CLI — Python 版漏洞扫描工具
 
 用法:
   python vuln_cli.py scan <target> [选项]       扫描目标（POC 模式）
+  python vuln_cli.py batch -l <urls.txt> [选项]  批量 URL 自动化扫描流水线
   python vuln_cli.py payload <target> [选项]    Payload 挖掘模式
   python vuln_cli.py waf <target>               WAF 探测与绕过测试
   python vuln_cli.py sensitive <target>         敏感文件扫描
@@ -1690,6 +1938,18 @@ scan 选项:
   --bypass                  请求被 WAF 拦截时自动尝试变形绕过重试
   --sensitive               POC 扫描前先进行敏感文件扫描
 
+batch 选项 (流水线: httpx 存活 → 黑名单过滤 → whatweb 指纹 → nuclei → 汇总):
+  -o, --output <dir>        输出目录 (默认: scan_results_时间戳)
+  --threads <n>             httpx 线程数 (默认: 10, 环境变量 THREADS)
+  --nuclei-c <n>            nuclei 并发线程数 (默认: 5, 环境变量 NUCLEI_C)
+  --nuclei-rate <n>         nuclei 每秒请求数 (默认: 10, 环境变量 NUCLEI_RATE)
+  --template <dir>          nuclei 模板目录 (默认: 自动查找 nuclei-templates)
+  --severity <levels>       nuclei 严重等级 (默认: critical,high,medium)
+  --delay <sec>             httpx 请求间隔秒 (默认: 0, 环境变量 DELAY)
+  --proxy <proxy>           HTTP/HTTPS 代理 (环境变量 PROXY)
+  --update-templates        运行前更新 nuclei 模板
+  --filter-keywords <kw>    标题过滤关键词, 逗号分隔 (默认: Burp Suite Professional)
+
 sensitive 选项:
   --interval <sec>  请求间隔 (默认: 1 秒)
 
@@ -1702,10 +1962,9 @@ payload 选项:
   python vuln_cli.py scan http://127.0.0.1:8080
   python vuln_cli.py scan http://target.com --pocs ./my_pocs --interval 1
   python vuln_cli.py scan http://target.com --ai --ai-payload
-  python vuln_cli.py scan http://target.com --ai-payload --ai-payload-interval 5
-  python vuln_cli.py scan http://target.com --waf-detect
-  python vuln_cli.py scan http://target.com --waf-detect --bypass
-  python vuln_cli.py scan http://target.com --sensitive
+  python vuln_cli.py batch -l urls.txt
+  python vuln_cli.py batch -l urls.txt --template ./nuclei-templates --nuclei-rate 20
+  python vuln_cli.py batch -l urls.txt --proxy http://127.0.0.1:8080 --filter-keywords "Burp Suite,拦截页面"
   python vuln_cli.py waf http://target.com
   python vuln_cli.py sensitive http://target.com
   python vuln_cli.py payload "http://target.com/page?id=1" --type sqli
@@ -1758,6 +2017,20 @@ def main():
     p_list = subparsers.add_parser("list", help="列出 POC")
     p_list.add_argument("--pocs", help="POC 目录")
 
+    # batch
+    p_batch = subparsers.add_parser("batch", help="批量 URL 自动化扫描流水线 (httpx→whatweb→nuclei→汇总)")
+    p_batch.add_argument("-l", "--list", required=True, help="URL 列表文件路径")
+    p_batch.add_argument("-o", "--output", default=None, help="输出目录 (默认: scan_results_时间戳)")
+    p_batch.add_argument("--threads", type=int, default=BATCH_DEFAULT_THREADS, help=f"httpx 线程数 (默认: {BATCH_DEFAULT_THREADS})")
+    p_batch.add_argument("--nuclei-c", type=int, default=BATCH_DEFAULT_NUCLEI_C, help=f"nuclei 并发线程数 (默认: {BATCH_DEFAULT_NUCLEI_C})")
+    p_batch.add_argument("--nuclei-rate", type=int, default=BATCH_DEFAULT_NUCLEI_RATE, help=f"nuclei 每秒请求数 (默认: {BATCH_DEFAULT_NUCLEI_RATE})")
+    p_batch.add_argument("--template", default=None, help="nuclei 模板目录 (默认: 自动查找)")
+    p_batch.add_argument("--severity", default="critical,high,medium", help="nuclei 严重等级 (默认: critical,high,medium)")
+    p_batch.add_argument("--delay", type=int, default=BATCH_DEFAULT_DELAY, help=f"httpx 请求间隔秒 (默认: {BATCH_DEFAULT_DELAY})")
+    p_batch.add_argument("--proxy", default=BATCH_DEFAULT_PROXY, help=f"HTTP/HTTPS 代理 (默认: {BATCH_DEFAULT_PROXY})")
+    p_batch.add_argument("--update-templates", action="store_true", help="运行前更新 nuclei 模板")
+    p_batch.add_argument("--filter-keywords", default="Burp Suite Professional", help="标题过滤关键词，多个用逗号分隔")
+
     # help
     subparsers.add_parser("help", help="显示帮助")
 
@@ -1771,6 +2044,8 @@ def main():
         cmd_sensitive(args)
     elif args.command == "payload":
         cmd_payload(args)
+    elif args.command == "batch":
+        cmd_batch(args)
     elif args.command == "list":
         cmd_list(args)
     elif args.command == "help" or args.command is None:

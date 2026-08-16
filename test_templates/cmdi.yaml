@@ -1,0 +1,15 @@
+id: local-cmdi-echo
+info:
+  name: Local CMdi Echo
+  author: test
+  severity: critical
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/?id=;echo vuln4marker{{randstr_6}}"
+    matchers-condition: and
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - "vuln4marker[a-z0-9]{6}"
